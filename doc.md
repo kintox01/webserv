@@ -152,30 +152,36 @@ EventLoop::run()
 └── BOUCLE INFINIE (tant que g_running == true)
       │
       ├── 1. Construire le tableau pollfd
-      │       ├── listen sockets  (POLLIN)    ← nouvelles connexions
-      │       └── client sockets  (POLLIN ou POLLOUT selon l'état)
+      │       ├── listen sockets  (POLLIN)             ← nouvelles connexions
+      │       ├── client sockets  (POLLIN ou POLLOUT selon l'état)
+      │       └── pipes CGI actifs (POLLIN/POLLOUT)     ← scripts en cours d'exécution
       │
       ├── 2. poll(&fds[0], n, 5000)           ← attendre max 5 secondes
       │
       ├── 3. Traiter les événements
-      │       ├── POLLIN sur listen fd  → acceptConnection()
-      │       ├── POLLIN sur client fd  → conn->onReadable()
-      │       └── POLLOUT sur client fd → conn->onWritable()
+      │       ├── POLLIN  sur listen fd → acceptConnection()
+      │       ├── POLLIN  sur client fd → conn->onReadable()
+      │       ├── POLLOUT sur client fd → conn->onWritable()
+      │       ├── POLLIN  sur pipe CGI  → conn->onCgiReadable()
+      │       └── POLLOUT sur pipe CGI  → conn->onCgiWritable()
       │
-      └── 4. Fermer les connexions mortes/timeout
+      └── 4. Fermer les connexions mortes/timeout (et tuer les CGI trop longs)
 ```
+
+**Un seul tableau, un seul `poll()` :** listen sockets, sockets clients *et* pipes CGI sont ajoutés au **même** tableau `pollfd` avant l'unique appel `poll()` de l'itération. Le sujet interdit explicitement de lire/écrire un descripteur en attente de données (pipe inclus) sans être passé par ce `poll()` — voir §9.
 
 ### Schéma avec plusieurs clients simultanés
 
 ```
 poll() surveille ces fds en même temps :
 
-  fd 3 (listen:8080) ──── POLLIN → accept → crée fd 7 (client A)
-  fd 7 (client A)    ──── POLLIN → lit la requête
-  fd 8 (client B)    ──── POLLOUT → envoie la réponse
-  fd 9 (client C)    ──── rien (timeout)
+  fd 3  (listen:8080)     ──── POLLIN  → accept → crée fd 7 (client A)
+  fd 7  (client A)        ──── POLLIN  → lit la requête
+  fd 8  (client B)        ──── POLLOUT → envoie la réponse
+  fd 11 (pipe CGI client D) ── POLLIN  → lit la sortie d'un script en cours
+  fd 9  (client C)        ──── rien (timeout)
 
-Un seul poll() → un seul thread → zéro blocage
+Un seul poll() → un seul thread → zéro blocage, même avec un CGI en cours
 ```
 
 ---
@@ -185,25 +191,26 @@ Un seul poll() → un seul thread → zéro blocage
 Chaque client a son objet `Connection`. C'est une **machine à états** :
 
 ```
-                ┌─────────────────────────────────────────┐
-                │                                         │
-                ▼                                         │
-          CONN_READING                             keep-alive ?
-         (recv les données)                           OUI ─► CONN_READING
-                │                                         │
-          requête complète ?                         NON ─► CONN_CLOSING
+                ┌───────────────────────────────────────────────────┐
+                │                                                   │
+                ▼                                                   │
+          CONN_READING                                       keep-alive ?
+         (recv les données)                                     OUI ─► CONN_READING
+                │                                                   │
+          requête complète ?                                   NON ─► CONN_CLOSING
                 │
-                ▼
-          buildAndSend()
-         (Router → réponse)
+                ├── route statique/upload/delete ──► buildAndSend() ──► CONN_WRITING
                 │
-                ▼
-          CONN_WRITING
-         (send les données)
+                └── route CGI ──► startCgi() ──► CONN_CGI
+                                        │
+                              onCgiReadable()/onCgiWritable()
+                              (pilotés par le MÊME poll(), voir §9)
+                                        │
+                                 CGI terminé (EOF) ──► CONN_WRITING
 ```
 
 **Pourquoi une machine à états ?**
-Parce que recv() et send() ne lisent/écrivent pas forcément tout en une fois (réseau fragmenté). On doit retenir où on en est entre deux appels à poll().
+Parce que recv() et send() ne lisent/écrivent pas forcément tout en une fois (réseau fragmenté), et parce qu'un CGI peut mettre du temps à répondre. On doit retenir où on en est entre deux appels à poll() — y compris pendant qu'un script tourne en tâche de fond.
 
 ### onReadable() — quand il y a des données à lire
 
@@ -261,13 +268,23 @@ PARSE_HEADERS
       │  lit les en-têtes un par un
       │  ligne vide → fin des en-têtes
       ▼
-PARSE_BODY (si POST avec Content-Length)
-      │  accumule body.size() == content_length octets
+PARSE_BODY (Content-Length)              PARSE_CHUNK_SIZE (Transfer-Encoding: chunked)
+      │  accumule body.size()                   │  lit "1a\r\n" (taille hexa du morceau)
+      │  == content_length octets                ▼
+      │                                    PARSE_CHUNK_DATA
+      │                                          │  accumule les octets du morceau
+      │                                          ▼
+      │                                    PARSE_CHUNK_CRLF ── \r\n final du morceau
+      │                                          │
+      │                                          └── morceau suivant, ou taille 0 →
+      │                                              PARSE_CHUNK_TRAILER → PARSE_COMPLETE
       ▼
 PARSE_COMPLETE  ─── feed() retourne true
 ```
 
 **Gestion du cas fragmenté :** Si recv() ne donne que la moitié de la première ligne, feed() stocke dans _buf et attend le prochain appel. La ligne sera assemblée au prochain poll().
+
+**Transfer-Encoding: chunked :** le sujet impose que le serveur "un-chunk" lui-même le corps avant de le transmettre au CGI (qui attend un corps brut terminé par EOF). Le parser détecte l'en-tête `Transfer-Encoding: chunked` et décode les morceaux (taille hexa + `\r\n` + données + `\r\n`, répété jusqu'à un morceau de taille 0) directement dans `body`, exactement comme s'il s'agissait d'un `Content-Length` classique — le reste du pipeline (Router, CGI) ne voit jamais la forme chunkée.
 
 ---
 
@@ -335,25 +352,35 @@ Résultat : "./www/etc/passwd"  ← jamais sorti de ./www
 
 CGI = Common Gateway Interface. Au lieu de servir un fichier statique, le serveur **exécute un programme** et sert sa sortie.
 
+**Important :** le sujet interdit explicitement de lire/écrire un pipe (ou tout descripteur en attente de données) sans passer par le `poll()` unique du serveur — y compris les pipes CGI. Le CGI n'est donc **jamais attendu de façon synchrone** : `Cgi::start()` se contente de `fork()` + brancher les pipes en non-bloquant, puis rend la main immédiatement. La lecture de la sortie du script et l'écriture du corps de la requête sont ensuite pilotées par l'EventLoop, exactement comme pour un socket client.
+
 ### Flux d'exécution
 
 ```
 Requête POST /cgi-bin/hello.py
               │
               ▼
-         fork()
+      Cgi::start() : fork() immédiat, pipes en O_NONBLOCK, retourne aussitôt
         /       \
 PARENT           ENFANT
 │                │
 │                ├── dup2(stdinPipe[0], STDIN)   ← corps POST → stdin du script
 │                ├── dup2(stdoutPipe[1], STDOUT) ← print() du script → réponse
-│                ├── setenv(REQUEST_METHOD, QUERY_STRING, ...)
+│                ├── chdir() dans le dossier du script
+│                ├── construit REQUEST_METHOD, QUERY_STRING, HTTP_* ...
 │                └── execve("/usr/bin/python3", ["python3", "hello.py"])
 │
-├── write(stdinPipe[1], req.body)  ← envoie le corps POST au script
-├── poll(stdoutPipe[0], 10000ms)   ← lit la sortie (avec timeout)
-└── waitpid()                      ← attendre la fin du processus
+Connection passe en état CONN_CGI
+│
+├── poll() (LE MÊME que pour les sockets clients) surveille :
+│     • cgiStdin  (POLLOUT) → onCgiWritable() : UNE écriture du corps par appel
+│     • cgiStdout (POLLIN)  → onCgiReadable() : UNE lecture de la sortie par appel
+│
+├── EOF sur cgiStdout → finishCgi() : waitpid() puis Cgi::buildResponse()
+└── si ça dépasse 10s (script en boucle infinie) → abortCgi() : kill(SIGKILL) + réponse 504
 ```
+
+Un script qui boucle à l'infini ne bloque donc jamais les autres clients : le serveur continue de répondre aux autres connexions pendant que ce CGI tourne, et la connexion concernée est débloquée au bout de 10 secondes avec une erreur 504.
 
 ### Variables d'environnement CGI (RFC 3875)
 
@@ -471,18 +498,23 @@ Un seul socket listen par port → selectServer() choisit le bon ServerBlock sel
 
 ## 13. Points clés pour l'évaluation
 
-| Point                 | Implémentation                                      |
-|-----------------------|-----------------------------------------------------|
-| poll() unique         | EventLoop.cpp — un seul appel par itération         |
-| Non-bloquant          | setNonBlocking() sur tous les fds                   |
-| Keep-alive            | _shouldClose + CONN_READING après envoi             |
-| CGI                   | fork() + execve() + pipes                           |
-| Upload                | handleUpload() → ofstream                           |
-| Autoindex             | serveDirectory() → HTML généré                      |
-| Error pages           | errorResponse() → fichier custom ou page générique  |
-| client_max_body_size  | vérification dans feed() → 413                      |
-| Path traversal        | buildFilePath() résout les ..                       |
-| Virtual hosts         | selectServer() compare Host: aux server_name        |
-| Timeout               | timedOut() → 60s sans activité                      |
-| SIGPIPE ignoré        | signal(SIGPIPE, SIG_IGN) dans EventLoop             |
-| SO_REUSEADDR          | setsockopt() pour éviter "Address in use"           |
+| Point                    | Implémentation                                                |
+|--------------------------|----------------------------------------------------------------|
+| poll() unique            | EventLoop.cpp — un seul appel par itération, listen + clients + pipes CGI |
+| poll() lit ET écrit à la fois | même tableau pollfd : POLLIN et POLLOUT selon l'état de chaque fd |
+| Non-bloquant             | setNonBlocking()/fcntl(O_NONBLOCK) sur TOUS les fds, y compris les pipes CGI |
+| errno jamais consulté    | onReadable/onWritable/onCgiReadable/onCgiWritable ne testent que la valeur de retour (0 / <0 / >0), jamais errno |
+| Une seule lecture/écriture par fd prêt | onReadable(), onWritable(), onCgiReadable(), onCgiWritable() font chacune UN seul recv/send/read/write par appel |
+| Keep-alive               | _shouldClose + CONN_READING après envoi                       |
+| CGI asynchrone           | Cgi::start() fork()+pipes non-bloquants, piloté par le poll() unique (aucun read/write hors poll()) |
+| CGI timeout              | cgiTimedOut() (10s) → abortCgi() → kill(SIGKILL) + réponse 504, sans jamais bloquer les autres clients |
+| Transfer-Encoding: chunked | HttpRequest::feed() dé-chunke avant de remplir body            |
+| Upload                   | handleUpload() → ofstream                                     |
+| Autoindex                | serveDirectory() → HTML généré                                |
+| Error pages              | errorResponse() → fichier custom ou page générique             |
+| client_max_body_size     | vérification dans feed() → 413                                 |
+| Path traversal           | buildFilePath() résout les ..                                  |
+| Virtual hosts (hors-sujet, ajouté en plus) | selectServer() compare Host: aux server_name |
+| Timeout de connexion     | timedOut() → 60s sans activité                                 |
+| SIGPIPE ignoré           | signal(SIGPIPE, SIG_IGN) dans EventLoop                        |
+| SO_REUSEADDR             | setsockopt() pour éviter "Address in use"                      |

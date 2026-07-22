@@ -128,6 +128,10 @@ void EventLoop::checkTimeouts() {
     std::vector<int> toClose;
     for (std::map<int, Connection*>::iterator it = _connections.begin();
          it != _connections.end(); ++it) {
+        // Un CGI qui tourne depuis trop longtemps (ex: script en boucle infinie)
+        // est tue explicitement : la connexion ne doit jamais rester bloquee.
+        if (it->second->cgiTimedOut())
+            it->second->abortCgi(504);
         if (it->second->timedOut() || it->second->state == CONN_CLOSING)
             toClose.push_back(it->first);
     }
@@ -135,39 +139,61 @@ void EventLoop::checkTimeouts() {
         closeConnection(toClose[i]);
 }
 
+// Ce que represente chaque entree du tableau de pollfd de cette iteration.
+enum PollKind { POLL_LISTEN, POLL_CLIENT, POLL_CGI_OUT, POLL_CGI_IN };
+
 // La boucle principale.
 //
-// A chaque iteration :
-//   1. Construire le tableau de pollfd (listen sockets + connections actives)
+// A chaque iteration, UN SEUL tableau de pollfd rassemble absolument tous les
+// descripteurs en attente de donnees : sockets d'ecoute, sockets clients, et
+// pipes CGI (stdin/stdout des scripts en cours d'execution). C'est l'unique
+// appel poll() du serveur.
+//
+//   1. Construire ce tableau (listen + clients + pipes CGI actifs)
 //   2. Appeler poll() avec timeout de 5s
 //   3. Traiter les evenements :
-//      - POLLIN sur un listen fd -> accept()
-//      - POLLIN sur un client fd -> lire la requete
-//      - POLLOUT sur un client fd -> envoyer la reponse
+//      - POLLIN  sur un listen fd  -> accept()
+//      - POLLIN  sur un client fd  -> lire la requete
+//      - POLLOUT sur un client fd  -> envoyer la reponse
+//      - POLLIN  sur un pipe CGI   -> lire la sortie du script
+//      - POLLOUT sur un pipe CGI   -> ecrire le corps de la requete au script
 //   4. Fermer les connexions mortes / en timeout
 void EventLoop::run() {
     while (g_running) {
         std::vector<struct pollfd> fds;
+        std::vector<PollKind>      kinds;
+        std::vector<int>           owners; // pour POLL_CLIENT/CGI_*: fd du client proprietaire
 
         // Ajouter les sockets d'ecoute
         for (size_t i = 0; i < _listenFds.size(); i++) {
             struct pollfd pfd;
-            pfd.fd      = _listenFds[i];
-            pfd.events  = POLLIN;
-            pfd.revents = 0;
-            fds.push_back(pfd);
+            pfd.fd = _listenFds[i]; pfd.events = POLLIN; pfd.revents = 0;
+            fds.push_back(pfd); kinds.push_back(POLL_LISTEN); owners.push_back(-1);
         }
 
-        // Ajouter les connexions clients
+        // Ajouter les connexions clients et, le cas echeant, les pipes CGI en cours
         for (std::map<int, Connection*>::iterator it = _connections.begin();
              it != _connections.end(); ++it) {
+            Connection* conn = it->second;
             struct pollfd pfd;
-            pfd.fd      = it->first;
             pfd.revents = 0;
-            if      (it->second->state == CONN_READING) pfd.events = POLLIN;
-            else if (it->second->state == CONN_WRITING) pfd.events = POLLOUT;
-            else                                         pfd.events = 0;
-            fds.push_back(pfd);
+
+            if (conn->state == CONN_READING) {
+                pfd.fd = it->first; pfd.events = POLLIN;
+                fds.push_back(pfd); kinds.push_back(POLL_CLIENT); owners.push_back(it->first);
+            } else if (conn->state == CONN_WRITING) {
+                pfd.fd = it->first; pfd.events = POLLOUT;
+                fds.push_back(pfd); kinds.push_back(POLL_CLIENT); owners.push_back(it->first);
+            } else if (conn->state == CONN_CGI) {
+                if (conn->cgiStdout != -1) {
+                    pfd.fd = conn->cgiStdout; pfd.events = POLLIN; pfd.revents = 0;
+                    fds.push_back(pfd); kinds.push_back(POLL_CGI_OUT); owners.push_back(it->first);
+                }
+                if (conn->cgiStdin != -1) {
+                    pfd.fd = conn->cgiStdin; pfd.events = POLLOUT; pfd.revents = 0;
+                    fds.push_back(pfd); kinds.push_back(POLL_CGI_IN); owners.push_back(it->first);
+                }
+            }
         }
 
         // L'UNIQUE appel poll() du serveur
@@ -183,32 +209,39 @@ void EventLoop::run() {
             continue;
         }
 
-        // Traiter les sockets d'ecoute (nouvelles connexions)
-        for (size_t i = 0; i < _listenFds.size(); i++) {
-            if (fds[i].revents & POLLIN)
-                acceptConnection(_listenFds[i], _listenPorts[i]);
-        }
-
-        // Traiter les connexions clients
+        // Traiter tous les evenements signales
         std::vector<int> toClose;
-        for (size_t i = _listenFds.size(); i < fds.size(); i++) {
-            int fd = fds[i].fd;
-            std::map<int, Connection*>::iterator it = _connections.find(fd);
+        for (size_t i = 0; i < fds.size(); i++) {
+            if (fds[i].revents == 0) continue;
+
+            if (kinds[i] == POLL_LISTEN) {
+                if (fds[i].revents & POLLIN)
+                    acceptConnection(fds[i].fd, _listenPorts[i]);
+                continue;
+            }
+
+            std::map<int, Connection*>::iterator it = _connections.find(owners[i]);
             if (it == _connections.end()) continue;
             Connection* conn = it->second;
 
-            if (fds[i].revents & (POLLERR | POLLHUP)) {
-                toClose.push_back(fd);
-                continue;
+            if (kinds[i] == POLL_CLIENT) {
+                if (fds[i].revents & (POLLERR | POLLHUP)) { toClose.push_back(owners[i]); continue; }
+                if ((fds[i].revents & POLLIN)  && conn->state == CONN_READING) {
+                    if (!conn->onReadable()) { toClose.push_back(owners[i]); continue; }
+                }
+                if ((fds[i].revents & POLLOUT) && conn->state == CONN_WRITING) {
+                    if (!conn->onWritable()) { toClose.push_back(owners[i]); continue; }
+                }
+            } else if (kinds[i] == POLL_CGI_OUT) {
+                if (fds[i].revents & (POLLIN | POLLHUP | POLLERR))
+                    conn->onCgiReadable();
+            } else if (kinds[i] == POLL_CGI_IN) {
+                if (fds[i].revents & (POLLOUT | POLLERR))
+                    conn->onCgiWritable();
             }
-            if ((fds[i].revents & POLLIN) && conn->state == CONN_READING) {
-                if (!conn->onReadable()) { toClose.push_back(fd); continue; }
-            }
-            if ((fds[i].revents & POLLOUT) && conn->state == CONN_WRITING) {
-                if (!conn->onWritable()) { toClose.push_back(fd); continue; }
-            }
+
             if (conn->state == CONN_CLOSING || conn->timedOut())
-                toClose.push_back(fd);
+                toClose.push_back(owners[i]);
         }
 
         // Supprimer les doublons et fermer les connexions mortes

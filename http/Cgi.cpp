@@ -1,54 +1,54 @@
 #include "Cgi.hpp"
-#include "../utils/Logger.hpp"
 #include <unistd.h>
-#include <sys/wait.h>
-#include <poll.h>
 #include <fcntl.h>
-#include <cerrno>
 #include <cstring>
 #include <cstdlib>
 #include <sstream>
 #include <cctype>
 #include <vector>
+#include <map>
 
 static std::string intStr(int n) {
     std::ostringstream ss; ss << n; return ss.str();
 }
 
-HttpResponse Cgi::execute(const HttpRequest& req,
-                           const std::string& scriptPath,
-                           const std::string& interpreter,
-                           const ServerBlock& server,
-                           const LocationBlock& loc) {
-    // Deux pipes : un pour l'stdin du CGI (corps POST), un pour son stdout
+static void setNonBlocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+bool Cgi::start(const HttpRequest& req,
+                const std::string& scriptPath,
+                const std::string& interpreter,
+                const ServerBlock& server,
+                pid_t& pid, int& inFd, int& outFd) {
+    // Deux pipes : un pour le stdin du CGI (corps de la requete), un pour son stdout
     int stdinPipe[2], stdoutPipe[2];
-    if (pipe(stdinPipe) < 0 || pipe(stdoutPipe) < 0) {
-        HttpResponse res; res.setStatus(500);
-        res.setBody("pipe() failed: " + std::string(strerror(errno)), "text/plain");
-        return res;
+    if (pipe(stdinPipe) < 0) return false;
+    if (pipe(stdoutPipe) < 0) {
+        close(stdinPipe[0]); close(stdinPipe[1]);
+        return false;
     }
 
-    pid_t pid = fork();
+    pid = fork();
     if (pid < 0) {
         close(stdinPipe[0]);  close(stdinPipe[1]);
         close(stdoutPipe[0]); close(stdoutPipe[1]);
-        HttpResponse res; res.setStatus(500);
-        res.setBody("fork() failed", "text/plain");
-        return res;
+        return false;
     }
 
     if (pid == 0) {
         // --- Processus enfant : executer le script CGI ---
         dup2(stdinPipe[0],  STDIN_FILENO);  // stdin  = lecture du pipe
         dup2(stdoutPipe[1], STDOUT_FILENO); // stdout = ecriture dans le pipe
-        close(stdinPipe[1]);
-        close(stdoutPipe[0]);
+        close(stdinPipe[0]);  close(stdinPipe[1]);
+        close(stdoutPipe[0]); close(stdoutPipe[1]);
 
         // Separer dossier et nom de fichier du script (chemin relatif au
         // repertoire de lancement du serveur, ex: "./www/cgi-bin/hello.py").
         // On se place dans le dossier du script avec chdir(), puis on ne
         // reference plus que son nom seul : inutile de calculer un chemin
-        // absolu (pas de realpath()/getcwd() ici, hors de la liste autorisee).
+        // absolu (pas de realpath()/getcwd(), hors de la liste autorisee).
         std::string dir, filename;
         size_t      sep = scriptPath.rfind('/');
         if (sep != std::string::npos) {
@@ -60,10 +60,8 @@ HttpResponse Cgi::execute(const HttpRequest& req,
         }
         chdir(dir.c_str());
 
-        // Variables d'environnement CGI (RFC 3875)
-        // (construites entierement avant de fabriquer le tableau de char*
-        // passe a execve, pour ne jamais garder un pointeur vers une
-        // std::string qu'on modifierait/reallouerait ensuite)
+        // Variables d'environnement CGI (RFC 3875), construites entierement
+        // avant de fabriquer le tableau de char* passe a execve.
         std::vector<std::string> envStrs;
         envStrs.push_back("REQUEST_METHOD="    + req.method);
         envStrs.push_back("QUERY_STRING="      + req.query);
@@ -111,38 +109,17 @@ HttpResponse Cgi::execute(const HttpRequest& req,
     close(stdinPipe[0]);
     close(stdoutPipe[1]);
 
-    // Envoyer le corps de la requete au CGI via son stdin
-    if (!req.body.empty()) {
-        const char* ptr       = req.body.data();
-        size_t      remaining = req.body.size();
-        while (remaining > 0) {
-            ssize_t written = write(stdinPipe[1], ptr, remaining);
-            if (written <= 0) break;
-            ptr       += (size_t)written;
-            remaining -= (size_t)written;
-        }
-    }
-    close(stdinPipe[1]);
+    // Les deux extremites cote parent passent en non-bloquant : leur lecture/
+    // ecriture sera desormais entierement pilotee par le poll() de l'EventLoop.
+    setNonBlocking(stdinPipe[1]);
+    setNonBlocking(stdoutPipe[0]);
 
-    // Lire la sortie CGI avec un timeout de 10 secondes
-    std::string output;
-    char        buf[4096];
-    struct pollfd pfd;
-    pfd.fd     = stdoutPipe[0];
-    pfd.events = POLLIN;
+    inFd  = stdinPipe[1];
+    outFd = stdoutPipe[0];
+    return true;
+}
 
-    while (true) {
-        int r = poll(&pfd, 1, 10000); // timeout 10s
-        if (r <= 0) break;            // timeout ou erreur
-        ssize_t n = read(stdoutPipe[0], buf, sizeof(buf));
-        if (n <= 0) break;
-        output.append(buf, (size_t)n);
-    }
-    close(stdoutPipe[0]);
-
-    int wstatus;
-    waitpid(pid, &wstatus, 0);
-
+HttpResponse Cgi::buildResponse(const std::string& output) {
     // Separer les en-tetes CGI du corps (\r\n\r\n ou \n\n)
     size_t sep    = output.find("\r\n\r\n");
     size_t sepLen = 4;
@@ -182,13 +159,11 @@ HttpResponse Cgi::execute(const HttpRequest& req,
             res.setStatus(302);
             res.setHeader("Location", loc_url);
             res.setBody("", "text/html");
-            (void)loc;
             return res;
         }
     }
 
     res.setStatus(cgiStatus);
     res.setBody(bodyPart, contentType);
-    (void)loc;
     return res;
 }

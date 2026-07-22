@@ -1,5 +1,4 @@
 #include "Router.hpp"
-#include "Cgi.hpp"
 #include "../utils/MIME.hpp"
 #include "../utils/Logger.hpp"
 #include <sys/stat.h>
@@ -208,31 +207,24 @@ HttpResponse Router::handleUpload(const LocationBlock& loc, const HttpRequest& r
     return res;
 }
 
-HttpResponse Router::handleCgi(const LocationBlock& loc, const HttpRequest& req,
-                                const std::string& scriptPath,
-                                const std::string& interpreter) {
-    Cgi cgi;
-    return cgi.execute(req, scriptPath, interpreter, _server, loc);
-}
-
-// Point d'entree principal : traiter une requete et retourner une reponse
-HttpResponse Router::handle(const HttpRequest& req) {
+// Point d'entree principal : traiter une requete.
+// Renvoie true et remplit res si la reponse est prete tout de suite ;
+// renvoie false et remplit cgiOut si un CGI doit etre lance de facon asynchrone.
+bool Router::handle(const HttpRequest& req, HttpResponse& res, CgiRequest& cgiOut) {
     const LocationBlock* loc = findLocation(req.path);
-    if (!loc) return errorResponse(404);
+    if (!loc) { res = errorResponse(404); return true; }
 
     // Redirection configuree dans la location
     if (loc->redirect_code != 0) {
-        HttpResponse res;
         res.setStatus(loc->redirect_code);
         if (!loc->redirect_url.empty())
             res.setHeader("Location", loc->redirect_url);
         res.setBody("", "text/html");
-        return res;
+        return true;
     }
 
     // Methode non autorisee pour cette location
-    if (!methodAllowed(*loc, req.method))
-        return errorResponse(405);
+    if (!methodAllowed(*loc, req.method)) { res = errorResponse(405); return true; }
 
     // Construire le chemin fichier
     std::string fullPath = buildFilePath(*loc, req.path);
@@ -243,43 +235,42 @@ HttpResponse Router::handle(const HttpRequest& req) {
         if (dot != std::string::npos) {
             std::string ext = fullPath.substr(dot);
             for (size_t i = 0; i < loc->cgi_handlers.size(); i++) {
-                if (loc->cgi_handlers[i].extension == ext)
-                    return handleCgi(*loc, req, fullPath,
-                                     loc->cgi_handlers[i].interpreter);
+                if (loc->cgi_handlers[i].extension == ext) {
+                    cgiOut.scriptPath  = fullPath;
+                    cgiOut.interpreter = loc->cgi_handlers[i].interpreter;
+                    return false;
+                }
             }
         }
     }
 
     // DELETE : supprimer le fichier
     if (req.method == "DELETE") {
-        if (remove(fullPath.c_str()) != 0)
-            return errorResponse(errno == ENOENT ? 404 : 403);
-        HttpResponse res;
+        if (remove(fullPath.c_str()) != 0) { res = errorResponse(errno == ENOENT ? 404 : 403); return true; }
         res.setStatus(204);
-        return res;
+        return true;
     }
 
     // POST sans CGI = upload
-    if (req.method == "POST")
-        return handleUpload(*loc, req);
+    if (req.method == "POST") { res = handleUpload(*loc, req); return true; }
 
     // GET / HEAD : servir le fichier ou le dossier
     struct stat st;
-    if (stat(fullPath.c_str(), &st) != 0) return errorResponse(404);
+    if (stat(fullPath.c_str(), &st) != 0) { res = errorResponse(404); return true; }
 
     if (S_ISDIR(st.st_mode)) {
         // Forcer le slash final pour que les liens relatifs fonctionnent
         if (req.path.empty() || req.path[req.path.size() - 1] != '/') {
-            HttpResponse res;
             res.setStatus(301);
             res.setHeader("Location", req.path + "/");
             res.setBody("", "text/html");
-            return res;
+            return true;
         }
-        return serveDirectory(fullPath, *loc, req.path);
+        res = serveDirectory(fullPath, *loc, req.path);
+        return true;
     }
 
-    HttpResponse res = serveFile(fullPath);
+    res = serveFile(fullPath);
     if (req.method == "HEAD") res.body.clear(); // HEAD = memes en-tetes, pas de corps
-    return res;
+    return true;
 }

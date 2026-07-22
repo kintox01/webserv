@@ -26,8 +26,12 @@ It supports:
   level (no dedicated semantics beyond that yet — see limitations below)
 - Static file serving with correct `Content-Type` detection
 - Directory listing (autoindex) and default index files
-- File uploads via POST
-- CGI execution (Python by default, configurable per extension)
+- File uploads via POST, including `Transfer-Encoding: chunked` bodies
+  (decoded by the server before they reach the router or the CGI)
+- CGI execution (Python by default, configurable per extension), run
+  asynchronously — its pipes are driven by the same single `poll()` as every
+  client socket, so a hanging script (e.g. an infinite loop) can't freeze the
+  rest of the server; it gets killed and answered with a 504 after 10s
 - Multiple virtual hosts on the same port, dispatched by the `Host` header
 - Custom error pages, redirections, per-location method restrictions
 - Keep-alive connections and configurable `client_max_body_size`
@@ -107,11 +111,9 @@ instead of leaving sockets or child processes behind.
 ### Known limitations
 
 We'd rather be upfront about these than have someone find them during
-evaluation: `Transfer-Encoding: chunked` isn't supported (only
-`Content-Length`), `PUT`/`OPTIONS` don't have dedicated behaviour yet, and
-there's no hard kill on a CGI script that hangs past its read timeout (the
-read loop gives up after 10s, but the child process itself isn't forcibly
-terminated).
+evaluation: `PUT`/`OPTIONS` are accepted by the parser but don't have
+dedicated behaviour beyond that (a `PUT` currently falls through to the
+same path as a `GET`).
 
 ## Resources
 
@@ -132,14 +134,23 @@ Things that were actually useful while building this, beyond the subject PDF:
 - [nginx documentation](https://nginx.org/en/docs/) — as inspiration for the
   configuration file syntax (`server {}` / `location {}` blocks)
 
-**On AI use:** Claude (Claude Code) was used at a couple of specific points,
-not to design or write the core logic. It helped debug some genuinely
-annoying issues — things like file descriptor leaks on early-return paths
-and edge cases in the incremental HTTP parser when a request got split
-across reads in unlucky ways. It was also used to help write and organize
-the technical documentation (`doc.md`) and clean up code comments once the
-logic itself was already working. The event loop, the state machines, the
-routing and the CGI handling were designed and implemented by us.
+**On AI use:** Claude (Claude Code) was used at several points, not to hand
+off the project wholesale. Early on, it helped debug some genuinely annoying
+issues — file descriptor leaks on early-return paths and edge cases in the
+incremental HTTP parser when a request got split across reads in unlucky
+ways — and to write/organize the technical documentation (`doc.md`).
+
+Later, after re-reading the subject's exact wording on I/O multiplexing, we
+used it to rework two specific parts to match it precisely: making the CGI
+pipes non-blocking and driven by the same single `poll()` as client sockets
+instead of being read/written synchronously (the subject explicitly forbids
+`read`/`write` on any waitable descriptor — pipes included — outside of
+`poll()`), removing an `errno` check after `recv()`/`send()` that the subject
+flags as an automatic 0, and adding `Transfer-Encoding: chunked` decoding,
+which the subject requires ahead of handing a body to a CGI. Each of those
+changes was reviewed against the subject text and tested manually (including
+an infinite-loop CGI script to confirm the rest of the server stays
+responsive) rather than taken on faith.
 
 ## Project structure
 
