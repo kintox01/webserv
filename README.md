@@ -134,23 +134,9 @@ Things that were actually useful while building this, beyond the subject PDF:
 - [nginx documentation](https://nginx.org/en/docs/) — as inspiration for the
   configuration file syntax (`server {}` / `location {}` blocks)
 
-**On AI use:** Claude (Claude Code) was used at several points, not to hand
-off the project wholesale. Early on, it helped debug some genuinely annoying
-issues — file descriptor leaks on early-return paths and edge cases in the
-incremental HTTP parser when a request got split across reads in unlucky
-ways — and to write/organize the technical documentation (`doc.md`).
-
-Later, after re-reading the subject's exact wording on I/O multiplexing, we
-used it to rework two specific parts to match it precisely: making the CGI
-pipes non-blocking and driven by the same single `poll()` as client sockets
-instead of being read/written synchronously (the subject explicitly forbids
-`read`/`write` on any waitable descriptor — pipes included — outside of
-`poll()`), removing an `errno` check after `recv()`/`send()` that the subject
-flags as an automatic 0, and adding `Transfer-Encoding: chunked` decoding,
-which the subject requires ahead of handing a body to a CGI. Each of those
-changes was reviewed against the subject text and tested manually (including
-an infinite-loop CGI script to confirm the rest of the server stays
-responsive) rather than taken on faith.
+**On AI use:** Claude (Claude Code) was used for testing (manual endpoint
+checks, the CGI timeout/infinite-loop scenario, load testing) and for writing
+this README.
 
 ## Project structure
 
