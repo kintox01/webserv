@@ -2,7 +2,7 @@
 #include "../utils/Logger.hpp"
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <arpa/inet.h>
+#include <netdb.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <poll.h>
@@ -52,26 +52,45 @@ void EventLoop::setupListenSockets() {
         if (seenPorts.count(port)) continue; // deja cree pour ce port
         seenPorts.insert(port);
 
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) throw std::runtime_error("socket() failed");
+        // Resoudre host:port en une struct sockaddr via getaddrinfo
+        // (plutot que remplir une sockaddr_in a la main avec inet_pton).
+        struct addrinfo hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family   = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags    = AI_NUMERICHOST | AI_NUMERICSERV; // host/port deja numeriques
+
+        std::ostringstream portStr;
+        portStr << port;
+
+        struct addrinfo* res;
+        int gaiErr = getaddrinfo(_servers[i].host.c_str(), portStr.str().c_str(), &hints, &res);
+        if (gaiErr != 0) {
+            std::ostringstream ss;
+            ss << "getaddrinfo() failed for " << _servers[i].host << ":" << port
+               << ": " << gai_strerror(gaiErr);
+            throw std::runtime_error(ss.str());
+        }
+
+        int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (fd < 0) {
+            freeaddrinfo(res);
+            throw std::runtime_error("socket() failed");
+        }
 
         // SO_REUSEADDR : eviter "Address already in use" apres redemarrage
         int opt = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
         setNonBlocking(fd);
 
-        struct sockaddr_in addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_port   = htons((uint16_t)port);
-        inet_pton(AF_INET, _servers[i].host.c_str(), &addr.sin_addr);
-
-        if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        if (bind(fd, res->ai_addr, res->ai_addrlen) < 0) {
             std::ostringstream ss;
             ss << "bind() failed on port " << port << ": " << strerror(errno);
+            freeaddrinfo(res);
             close(fd);
             throw std::runtime_error(ss.str());
         }
+        freeaddrinfo(res);
         if (listen(fd, SOMAXCONN) < 0) {
             close(fd);
             throw std::runtime_error("listen() failed");

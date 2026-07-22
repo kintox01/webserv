@@ -44,13 +44,32 @@ HttpResponse Cgi::execute(const HttpRequest& req,
         close(stdinPipe[1]);
         close(stdoutPipe[0]);
 
+        // Separer dossier et nom de fichier du script (chemin relatif au
+        // repertoire de lancement du serveur, ex: "./www/cgi-bin/hello.py").
+        // On se place dans le dossier du script avec chdir(), puis on ne
+        // reference plus que son nom seul : inutile de calculer un chemin
+        // absolu (pas de realpath()/getcwd() ici, hors de la liste autorisee).
+        std::string dir, filename;
+        size_t      sep = scriptPath.rfind('/');
+        if (sep != std::string::npos) {
+            dir      = scriptPath.substr(0, sep);
+            filename = scriptPath.substr(sep + 1);
+        } else {
+            dir      = ".";
+            filename = scriptPath;
+        }
+        chdir(dir.c_str());
+
         // Variables d'environnement CGI (RFC 3875)
+        // (construites entierement avant de fabriquer le tableau de char*
+        // passe a execve, pour ne jamais garder un pointeur vers une
+        // std::string qu'on modifierait/reallouerait ensuite)
         std::vector<std::string> envStrs;
         envStrs.push_back("REQUEST_METHOD="    + req.method);
         envStrs.push_back("QUERY_STRING="      + req.query);
         envStrs.push_back("CONTENT_LENGTH="    + intStr((int)req.body.size()));
         envStrs.push_back("CONTENT_TYPE="      + req.header("content-type"));
-        envStrs.push_back("SCRIPT_FILENAME="   + scriptPath);
+        envStrs.push_back("SCRIPT_FILENAME="   + filename); // valide car CWD = dir
         envStrs.push_back("SCRIPT_NAME="       + req.path);
         envStrs.push_back("PATH_INFO="         + req.path);
         envStrs.push_back("SERVER_NAME="       + server.host);
@@ -76,28 +95,9 @@ HttpResponse Cgi::execute(const HttpRequest& req,
             env.push_back(const_cast<char*>(envStrs[i].c_str()));
         env.push_back(NULL);
 
-        // Convertir le chemin du script en chemin absolu AVANT chdir
-        // (un chemin relatif devient invalide apres chdir)
-        char absScriptPath[4096];
-        if (realpath(scriptPath.c_str(), absScriptPath) == NULL) {
-            strncpy(absScriptPath, scriptPath.c_str(), sizeof(absScriptPath) - 1);
-            absScriptPath[sizeof(absScriptPath) - 1] = '\0';
-        }
-
-        // Mettre a jour SCRIPT_FILENAME avec le chemin absolu
-        for (size_t k = 0; k < envStrs.size(); k++) {
-            if (envStrs[k].substr(0, 16) == "SCRIPT_FILENAME=")
-                envStrs[k] = std::string("SCRIPT_FILENAME=") + absScriptPath;
-        }
-
-        // Se placer dans le repertoire du script
-        std::string dir = std::string(absScriptPath);
-        size_t      sep = dir.rfind('/');
-        if (sep != std::string::npos) chdir(dir.substr(0, sep).c_str());
-
         char* argv[3];
         argv[0] = const_cast<char*>(interpreter.c_str());
-        argv[1] = absScriptPath; // chemin absolu valide meme apres chdir
+        argv[1] = const_cast<char*>(filename.c_str()); // valide car CWD = dir
         argv[2] = NULL;
 
         execve(interpreter.c_str(), argv, &env[0]);
