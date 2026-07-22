@@ -1,0 +1,13 @@
+# Build artifacts
+*.o
+webserv
+
+# OS cruft
+.DS_Store
+
+# Local tool config, not meant to be shared
+.claude/
+
+# Runtime uploads (keep the folder, ignore its contents)
+www/uploads/*
+!www/uploads/.gitkeep

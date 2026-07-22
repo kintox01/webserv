@@ -1,0 +1,204 @@
+#include "EventLoop.hpp"
+#include "../utils/Logger.hpp"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <poll.h>
+#include <cerrno>
+#include <cstring>
+#include <stdexcept>
+#include <sstream>
+#include <csignal>
+#include <algorithm>
+#include <set>
+
+// Variable globale pour gerer Ctrl+C proprement
+static volatile bool g_running = true;
+static void          sigHandler(int) { g_running = false; }
+
+static void setNonBlocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+EventLoop::EventLoop(const std::vector<ServerBlock>& servers)
+    : _servers(servers) {
+    signal(SIGINT,  sigHandler); // Ctrl+C
+    signal(SIGTERM, sigHandler); // kill
+    signal(SIGPIPE, SIG_IGN);   // ecriture sur socket fermee -> ignorer
+    setupListenSockets();
+}
+
+EventLoop::~EventLoop() {
+    for (std::map<int, Connection*>::iterator it = _connections.begin();
+         it != _connections.end(); ++it) {
+        close(it->first);
+        delete it->second;
+    }
+    for (size_t i = 0; i < _listenFds.size(); i++)
+        close(_listenFds[i]);
+}
+
+// Creer un socket d'ecoute pour chaque port unique dans la config.
+// Si deux serveurs partagent le meme port, on cree UN seul socket ;
+// la distinction se fera par le header "Host" dans la requete.
+void EventLoop::setupListenSockets() {
+    std::set<int> seenPorts;
+
+    for (size_t i = 0; i < _servers.size(); i++) {
+        int port = _servers[i].port;
+        if (seenPorts.count(port)) continue; // deja cree pour ce port
+        seenPorts.insert(port);
+
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) throw std::runtime_error("socket() failed");
+
+        // SO_REUSEADDR : eviter "Address already in use" apres redemarrage
+        int opt = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setNonBlocking(fd);
+
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port   = htons((uint16_t)port);
+        inet_pton(AF_INET, _servers[i].host.c_str(), &addr.sin_addr);
+
+        if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            std::ostringstream ss;
+            ss << "bind() failed on port " << port << ": " << strerror(errno);
+            close(fd);
+            throw std::runtime_error(ss.str());
+        }
+        if (listen(fd, SOMAXCONN) < 0) {
+            close(fd);
+            throw std::runtime_error("listen() failed");
+        }
+
+        _listenFds.push_back(fd);
+        _listenPorts.push_back(port);
+
+        std::ostringstream ss;
+        ss << "Serveur en ecoute sur " << _servers[i].host << ":" << port;
+        Logger::info(ss.str());
+    }
+}
+
+void EventLoop::acceptConnection(int listenFd, int port) {
+    struct sockaddr_in addr;
+    socklen_t          addrLen = sizeof(addr);
+    int clientFd = accept(listenFd, (struct sockaddr*)&addr, &addrLen);
+    if (clientFd < 0) return;
+
+    setNonBlocking(clientFd);
+    _connections[clientFd] = new Connection(clientFd, port, _servers);
+}
+
+void EventLoop::closeConnection(int fd) {
+    std::map<int, Connection*>::iterator it = _connections.find(fd);
+    if (it != _connections.end()) {
+        delete it->second;
+        _connections.erase(it);
+    }
+    close(fd);
+}
+
+void EventLoop::checkTimeouts() {
+    std::vector<int> toClose;
+    for (std::map<int, Connection*>::iterator it = _connections.begin();
+         it != _connections.end(); ++it) {
+        if (it->second->timedOut() || it->second->state == CONN_CLOSING)
+            toClose.push_back(it->first);
+    }
+    for (size_t i = 0; i < toClose.size(); i++)
+        closeConnection(toClose[i]);
+}
+
+// La boucle principale.
+//
+// A chaque iteration :
+//   1. Construire le tableau de pollfd (listen sockets + connections actives)
+//   2. Appeler poll() avec timeout de 5s
+//   3. Traiter les evenements :
+//      - POLLIN sur un listen fd -> accept()
+//      - POLLIN sur un client fd -> lire la requete
+//      - POLLOUT sur un client fd -> envoyer la reponse
+//   4. Fermer les connexions mortes / en timeout
+void EventLoop::run() {
+    while (g_running) {
+        std::vector<struct pollfd> fds;
+
+        // Ajouter les sockets d'ecoute
+        for (size_t i = 0; i < _listenFds.size(); i++) {
+            struct pollfd pfd;
+            pfd.fd      = _listenFds[i];
+            pfd.events  = POLLIN;
+            pfd.revents = 0;
+            fds.push_back(pfd);
+        }
+
+        // Ajouter les connexions clients
+        for (std::map<int, Connection*>::iterator it = _connections.begin();
+             it != _connections.end(); ++it) {
+            struct pollfd pfd;
+            pfd.fd      = it->first;
+            pfd.revents = 0;
+            if      (it->second->state == CONN_READING) pfd.events = POLLIN;
+            else if (it->second->state == CONN_WRITING) pfd.events = POLLOUT;
+            else                                         pfd.events = 0;
+            fds.push_back(pfd);
+        }
+
+        // L'UNIQUE appel poll() du serveur
+        if (fds.empty()) { checkTimeouts(); continue; }
+        int ready = poll(&fds[0], (nfds_t)fds.size(), 5000);
+        if (ready < 0) {
+            if (errno == EINTR) continue; // signal recu (ex: Ctrl+C)
+            Logger::error(std::string("poll() error: ") + strerror(errno));
+            break;
+        }
+        if (ready == 0) {
+            checkTimeouts();
+            continue;
+        }
+
+        // Traiter les sockets d'ecoute (nouvelles connexions)
+        for (size_t i = 0; i < _listenFds.size(); i++) {
+            if (fds[i].revents & POLLIN)
+                acceptConnection(_listenFds[i], _listenPorts[i]);
+        }
+
+        // Traiter les connexions clients
+        std::vector<int> toClose;
+        for (size_t i = _listenFds.size(); i < fds.size(); i++) {
+            int fd = fds[i].fd;
+            std::map<int, Connection*>::iterator it = _connections.find(fd);
+            if (it == _connections.end()) continue;
+            Connection* conn = it->second;
+
+            if (fds[i].revents & (POLLERR | POLLHUP)) {
+                toClose.push_back(fd);
+                continue;
+            }
+            if ((fds[i].revents & POLLIN) && conn->state == CONN_READING) {
+                if (!conn->onReadable()) { toClose.push_back(fd); continue; }
+            }
+            if ((fds[i].revents & POLLOUT) && conn->state == CONN_WRITING) {
+                if (!conn->onWritable()) { toClose.push_back(fd); continue; }
+            }
+            if (conn->state == CONN_CLOSING || conn->timedOut())
+                toClose.push_back(fd);
+        }
+
+        // Supprimer les doublons et fermer les connexions mortes
+        std::sort(toClose.begin(), toClose.end());
+        toClose.erase(std::unique(toClose.begin(), toClose.end()), toClose.end());
+        for (size_t i = 0; i < toClose.size(); i++)
+            closeConnection(toClose[i]);
+
+        checkTimeouts();
+    }
+    Logger::info("Serveur arrete.");
+}
