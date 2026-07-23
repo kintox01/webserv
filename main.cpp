@@ -5,7 +5,6 @@
 #include "utils/Logger.hpp"
 
 int main(int argc, char* argv[]) {
-    // Le fichier de config est passe en argument, ou "webserv.conf" par defaut
     std::string configPath = "webserv.conf";
     if (argc >= 2) configPath = argv[1];
 

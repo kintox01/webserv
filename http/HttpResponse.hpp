@@ -14,7 +14,6 @@ public:
     void        setHeader(const std::string& name, const std::string& value);
     void        setBody(const std::string& content, const std::string& type = "text/html");
 
-    // Construit la reponse HTTP brute (status line + headers + body)
     std::string build() const;
 
     static std::string statusText(int code);

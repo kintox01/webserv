@@ -14,7 +14,6 @@
 #include <algorithm>
 #include <set>
 
-// Variable globale pour gerer Ctrl+C proprement
 static volatile bool g_running = true;
 static void          sigHandler(int) { g_running = false; }
 
@@ -25,9 +24,9 @@ static void setNonBlocking(int fd) {
 
 EventLoop::EventLoop(const std::vector<ServerBlock>& servers)
     : _servers(servers) {
-    signal(SIGINT,  sigHandler); // Ctrl+C
-    signal(SIGTERM, sigHandler); // kill
-    signal(SIGPIPE, SIG_IGN);   // ecriture sur socket fermee -> ignorer
+    signal(SIGINT,  sigHandler);
+    signal(SIGTERM, sigHandler);
+    signal(SIGPIPE, SIG_IGN);
     setupListenSockets();
 }
 
@@ -41,24 +40,19 @@ EventLoop::~EventLoop() {
         close(_listenFds[i]);
 }
 
-// Creer un socket d'ecoute pour chaque port unique dans la config.
-// Si deux serveurs partagent le meme port, on cree UN seul socket ;
-// la distinction se fera par le header "Host" dans la requete.
 void EventLoop::setupListenSockets() {
     std::set<int> seenPorts;
 
     for (size_t i = 0; i < _servers.size(); i++) {
         int port = _servers[i].port;
-        if (seenPorts.count(port)) continue; // deja cree pour ce port
+        if (seenPorts.count(port)) continue;
         seenPorts.insert(port);
 
-        // Resoudre host:port en une struct sockaddr via getaddrinfo
-        // (plutot que remplir une sockaddr_in a la main avec inet_pton).
         struct addrinfo hints;
         memset(&hints, 0, sizeof(hints));
         hints.ai_family   = AF_INET;
         hints.ai_socktype = SOCK_STREAM;
-        hints.ai_flags    = AI_NUMERICHOST | AI_NUMERICSERV; // host/port deja numeriques
+        hints.ai_flags    = AI_NUMERICHOST | AI_NUMERICSERV;
 
         std::ostringstream portStr;
         portStr << port;
@@ -78,7 +72,6 @@ void EventLoop::setupListenSockets() {
             throw std::runtime_error("socket() failed");
         }
 
-        // SO_REUSEADDR : eviter "Address already in use" apres redemarrage
         int opt = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
         setNonBlocking(fd);
@@ -128,8 +121,6 @@ void EventLoop::checkTimeouts() {
     std::vector<int> toClose;
     for (std::map<int, Connection*>::iterator it = _connections.begin();
          it != _connections.end(); ++it) {
-        // Un CGI qui tourne depuis trop longtemps (ex: script en boucle infinie)
-        // est tue explicitement : la connexion ne doit jamais rester bloquee.
         if (it->second->cgiTimedOut())
             it->second->abortCgi(504);
         if (it->second->timedOut() || it->second->state == CONN_CLOSING)
@@ -139,39 +130,20 @@ void EventLoop::checkTimeouts() {
         closeConnection(toClose[i]);
 }
 
-// Ce que represente chaque entree du tableau de pollfd de cette iteration.
 enum PollKind { POLL_LISTEN, POLL_CLIENT, POLL_CGI_OUT, POLL_CGI_IN };
 
-// La boucle principale.
-//
-// A chaque iteration, UN SEUL tableau de pollfd rassemble absolument tous les
-// descripteurs en attente de donnees : sockets d'ecoute, sockets clients, et
-// pipes CGI (stdin/stdout des scripts en cours d'execution). C'est l'unique
-// appel poll() du serveur.
-//
-//   1. Construire ce tableau (listen + clients + pipes CGI actifs)
-//   2. Appeler poll() avec timeout de 5s
-//   3. Traiter les evenements :
-//      - POLLIN  sur un listen fd  -> accept()
-//      - POLLIN  sur un client fd  -> lire la requete
-//      - POLLOUT sur un client fd  -> envoyer la reponse
-//      - POLLIN  sur un pipe CGI   -> lire la sortie du script
-//      - POLLOUT sur un pipe CGI   -> ecrire le corps de la requete au script
-//   4. Fermer les connexions mortes / en timeout
 void EventLoop::run() {
     while (g_running) {
         std::vector<struct pollfd> fds;
         std::vector<PollKind>      kinds;
-        std::vector<int>           owners; // pour POLL_CLIENT/CGI_*: fd du client proprietaire
+        std::vector<int>           owners;
 
-        // Ajouter les sockets d'ecoute
         for (size_t i = 0; i < _listenFds.size(); i++) {
             struct pollfd pfd;
             pfd.fd = _listenFds[i]; pfd.events = POLLIN; pfd.revents = 0;
             fds.push_back(pfd); kinds.push_back(POLL_LISTEN); owners.push_back(-1);
         }
 
-        // Ajouter les connexions clients et, le cas echeant, les pipes CGI en cours
         for (std::map<int, Connection*>::iterator it = _connections.begin();
              it != _connections.end(); ++it) {
             Connection* conn = it->second;
@@ -196,11 +168,10 @@ void EventLoop::run() {
             }
         }
 
-        // L'UNIQUE appel poll() du serveur
         if (fds.empty()) { checkTimeouts(); continue; }
         int ready = poll(&fds[0], (nfds_t)fds.size(), 5000);
         if (ready < 0) {
-            if (errno == EINTR) continue; // signal recu (ex: Ctrl+C)
+            if (errno == EINTR) continue;
             Logger::error(std::string("poll() error: ") + strerror(errno));
             break;
         }
@@ -209,7 +180,6 @@ void EventLoop::run() {
             continue;
         }
 
-        // Traiter tous les evenements signales
         std::vector<int> toClose;
         for (size_t i = 0; i < fds.size(); i++) {
             if (fds[i].revents == 0) continue;
@@ -244,7 +214,6 @@ void EventLoop::run() {
                 toClose.push_back(owners[i]);
         }
 
-        // Supprimer les doublons et fermer les connexions mortes
         std::sort(toClose.begin(), toClose.end());
         toClose.erase(std::unique(toClose.begin(), toClose.end()), toClose.end());
         for (size_t i = 0; i < toClose.size(); i++)

@@ -39,7 +39,6 @@ std::string HttpResponse::statusText(int code) {
     }
 }
 
-// Page d'erreur HTML generique quand on n'a pas de page personnalisee
 std::string HttpResponse::defaultErrorPage(int code) {
     std::ostringstream ss;
     std::string text = statusText(code);
@@ -49,14 +48,11 @@ std::string HttpResponse::defaultErrorPage(int code) {
     return ss.str();
 }
 
-// Serialise la reponse en texte HTTP valide
 std::string HttpResponse::build() const {
     std::ostringstream ss;
 
-    // Ligne de statut
     ss << "HTTP/1.1 " << status << " " << statusText(status) << "\r\n";
 
-    // En-tetes fixes
     time_t t = time(NULL);
     char   dateBuf[64];
     strftime(dateBuf, sizeof(dateBuf), "%a, %d %b %Y %H:%M:%S GMT", gmtime(&t));
@@ -66,17 +62,15 @@ std::string HttpResponse::build() const {
     bool hasCL = headers.count("Content-Length") > 0;
     bool hasCT = headers.count("Content-Type")   > 0;
 
-    // En-tetes de l'utilisateur
     for (std::map<std::string, std::string>::const_iterator it = headers.begin();
          it != headers.end(); ++it) {
         ss << it->first << ": " << it->second << "\r\n";
     }
 
-    // Content-Length obligatoire (RFC 7230)
     if (!hasCL) ss << "Content-Length: " << body.size() << "\r\n";
     if (!hasCT && !body.empty()) ss << "Content-Type: text/html\r\n";
 
-    ss << "\r\n"; // Ligne vide separant les en-tetes du corps
+    ss << "\r\n";
     ss << body;
     return ss.str();
 }

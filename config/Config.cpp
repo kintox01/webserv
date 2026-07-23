@@ -9,35 +9,28 @@ Config::Config() : _pos(0) {}
 
 const std::vector<ServerBlock>& Config::servers() const { return _servers; }
 
-// ----- Tokenizer -----
-// Separe le fichier en tokens (mots, {, }, ;)
 std::vector<std::string> Config::tokenize(const std::string& content) {
     std::vector<std::string> tokens;
     size_t i = 0;
     while (i < content.size()) {
-        // Ignorer les espaces
         if (std::isspace((unsigned char)content[i])) { i++; continue; }
-        // Ignorer les commentaires jusqu'a la fin de la ligne
         if (content[i] == '#') {
             while (i < content.size() && content[i] != '\n') i++;
             continue;
         }
-        // Les accolades et les points-virgules sont des tokens a part entiere
         if (content[i] == '{' || content[i] == '}' || content[i] == ';') {
             tokens.push_back(std::string(1, content[i++]));
             continue;
         }
-        // Chaines entre guillemets simples ou doubles (ex: server_name "localhost";)
         if (content[i] == '"' || content[i] == '\'') {
             char        quote = content[i++];
             std::string tok;
             while (i < content.size() && content[i] != quote)
                 tok += content[i++];
-            if (i < content.size()) i++; // sauter le guillemet fermant
+            if (i < content.size()) i++;
             tokens.push_back(tok);
             continue;
         }
-        // Lire un mot jusqu'au prochain separateur
         std::string tok;
         while (i < content.size()
                && !std::isspace((unsigned char)content[i])
@@ -69,7 +62,6 @@ void Config::expect(const std::string& tok) {
 
 bool Config::atEnd() const { return _pos >= _tokens.size(); }
 
-// Convertit "10M" -> 10485760, "512k" -> 524288, "1G" -> 1073741824
 size_t Config::parseSize(const std::string& s) {
     if (s.empty()) return 0;
     size_t val = (size_t)std::atol(s.c_str());
@@ -110,7 +102,6 @@ ServerBlock Config::parseServer() {
     while (!atEnd() && peek() != "}") {
         std::string dir = next();
         if (dir == "listen") {
-            // "listen 8080;" ou "listen 127.0.0.1:8080;"
             std::string val = next();
             size_t colon = val.find(':');
             if (colon != std::string::npos) {
@@ -135,7 +126,6 @@ ServerBlock Config::parseServer() {
         } else if (dir == "location") {
             s.locations.push_back(parseLocation());
         } else {
-            // Directive inconnue : on l'ignore jusqu'au ;
             while (!atEnd() && peek() != ";" && peek() != "}") next();
             if (!atEnd() && peek() == ";") expect(";");
         }
@@ -146,7 +136,7 @@ ServerBlock Config::parseServer() {
 
 LocationBlock Config::parseLocation() {
     LocationBlock loc;
-    loc.path = next(); // le chemin URI, ex: /cgi-bin
+    loc.path = next();
     expect("{");
     while (!atEnd() && peek() != "}") {
         std::string dir = next();
@@ -168,8 +158,8 @@ LocationBlock Config::parseLocation() {
             loc.upload_store = next(); expect(";");
         } else if (dir == "cgi" || dir == "cgi_pass") {
             CgiEntry ce;
-            ce.extension    = next(); // ".py"
-            ce.interpreter  = next(); // "/usr/bin/python3"
+            ce.extension    = next();
+            ce.interpreter  = next();
             loc.cgi_handlers.push_back(ce);
             expect(";");
         } else {

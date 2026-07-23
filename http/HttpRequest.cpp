@@ -56,7 +56,6 @@ void HttpRequest::parseUri(const std::string& raw) {
 bool HttpRequest::parseRequestLine(const std::string& line) {
     std::istringstream ss(line);
     if (!(ss >> method >> uri >> version)) return false;
-    // Methodes acceptees
     if (method != "GET"    && method != "POST"   && method != "DELETE"
      && method != "HEAD"   && method != "PUT"    && method != "OPTIONS")
         return false;
@@ -73,39 +72,28 @@ bool HttpRequest::parseHeader(const std::string& line) {
     return true;
 }
 
-// Le coeur du parser : on l'appelle a chaque fois qu'on recoit des donnees.
-// La requete HTTP ressemble a :
-//   GET /index.html HTTP/1.1\r\n
-//   Host: localhost\r\n
-//   \r\n                        <- ligne vide = fin des en-tetes
-//   [corps pour POST]
 bool HttpRequest::feed(const char* data, size_t len, size_t maxBody) {
     _buf.append(data, len);
 
-    // Lire ligne par ligne tant qu'on est dans les en-tetes
     while (state == PARSE_REQUEST_LINE || state == PARSE_HEADERS) {
         size_t pos = _buf.find("\r\n");
         if (pos == std::string::npos) {
-            // Pas encore de fin de ligne : attendre plus de donnees
             if (_buf.size() > 8192) { state = PARSE_ERROR; error_code = 400; }
             break;
         }
         std::string line(_buf.data(), pos);
-        _buf.consume(pos + 2); // consommer la ligne + \r\n
+        _buf.consume(pos + 2);
 
         if (state == PARSE_REQUEST_LINE) {
             if (!parseRequestLine(line)) { state = PARSE_ERROR; error_code = 400; break; }
             state = PARSE_HEADERS;
         } else {
             if (line.empty()) {
-                // Ligne vide = fin des en-tetes
                 std::string te = toLower(header("transfer-encoding"));
 
                 if (method == "GET" || method == "DELETE" || method == "HEAD") {
                     state = PARSE_COMPLETE;
                 } else if (te.find("chunked") != std::string::npos) {
-                    // RFC 3875 : le serveur doit "un-chunk" le corps avant de le
-                    // transmettre au CGI, qui attend un corps brut termine par EOF.
                     state = PARSE_CHUNK_SIZE;
                 } else {
                     std::string cl = header("content-length");
@@ -120,7 +108,6 @@ bool HttpRequest::feed(const char* data, size_t len, size_t maxBody) {
         }
     }
 
-    // Lire le corps (Content-Length)
     if (state == PARSE_BODY) {
         size_t need = content_length - body.size();
         size_t have = _buf.size();
@@ -133,7 +120,6 @@ bool HttpRequest::feed(const char* data, size_t len, size_t maxBody) {
             state = PARSE_COMPLETE;
     }
 
-    // Lire le corps chunke (Transfer-Encoding: chunked)
     while (state == PARSE_CHUNK_SIZE  || state == PARSE_CHUNK_DATA
         || state == PARSE_CHUNK_CRLF  || state == PARSE_CHUNK_TRAILER) {
         if (state == PARSE_CHUNK_SIZE) {
@@ -145,7 +131,7 @@ bool HttpRequest::feed(const char* data, size_t len, size_t maxBody) {
             std::string line(_buf.data(), pos);
             _buf.consume(pos + 2);
 
-            size_t semi = line.find(';'); // ignorer les extensions de morceau
+            size_t semi = line.find(';');
             if (semi != std::string::npos) line = line.substr(0, semi);
 
             char* endp = NULL;
@@ -164,21 +150,20 @@ bool HttpRequest::feed(const char* data, size_t len, size_t maxBody) {
                 _buf.consume(take);
                 chunk_remaining -= take;
             }
-            if (chunk_remaining > 0) break; // attendre le reste du morceau
+            if (chunk_remaining > 0) break;
             state = PARSE_CHUNK_CRLF;
 
         } else if (state == PARSE_CHUNK_CRLF) {
-            if (_buf.size() < 2) break; // attendre le \r\n final du morceau
+            if (_buf.size() < 2) break;
             _buf.consume(2);
             state = PARSE_CHUNK_SIZE;
 
-        } else { // PARSE_CHUNK_TRAILER
+        } else {
             size_t pos = _buf.find("\r\n");
             if (pos == std::string::npos) break;
             std::string line(_buf.data(), pos);
             _buf.consume(pos + 2);
-            if (line.empty()) { state = PARSE_COMPLETE; break; } // fin des trailers
-            // sinon : en-tete de fin ignore, on continue a consommer les trailers
+            if (line.empty()) { state = PARSE_COMPLETE; break; }
         }
     }
 

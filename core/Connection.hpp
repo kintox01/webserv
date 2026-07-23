@@ -8,53 +8,45 @@
 #include "../http/Router.hpp"
 
 enum ConnState {
-    CONN_READING,  // on attend des donnees du client
-    CONN_CGI,      // requete complete, un script CGI tourne en tache de fond
-    CONN_WRITING,  // on envoie la reponse
-    CONN_CLOSING   // la connexion doit etre fermee
+    CONN_READING,
+    CONN_CGI,
+    CONN_WRITING,
+    CONN_CLOSING
 };
 
-// Represente une connexion TCP avec un client.
-// Machine a etats : READING -> [CGI ->] WRITING -> READING (keep-alive)
-// ou READING -> [CGI ->] WRITING -> CLOSING (Connection: close)
-//
-// Le CGI n'est jamais attendu de maniere synchrone : ses pipes (stdin/stdout)
-// sont geres par l'EventLoop exactement comme les sockets clients, via le
-// meme et unique poll(). Voir onCgiReadable()/onCgiWritable().
 class Connection {
 public:
-    int         fd;           // descripteur de fichier du socket client
-    int         port;         // port sur lequel la connexion est arrivee
+    int         fd;
+    int         port;
     ConnState   state;
     time_t      lastActivity;
 
-    HttpRequest request;       // parser de la requete en cours
-    std::string writeBuffer;   // reponse a envoyer
-    size_t      writePos;      // position dans writeBuffer
+    HttpRequest request;
+    std::string writeBuffer;
+    size_t      writePos;
 
-    // Etat du CGI en cours (valide uniquement si state == CONN_CGI)
     pid_t       cgiPid;
-    int         cgiStdin;      // extremite d'ecriture (corps requete -> CGI), -1 si fermee
-    int         cgiStdout;     // extremite de lecture (sortie CGI), -1 si fermee
-    std::string cgiBody;       // copie du corps de la requete a transmettre au CGI
-    size_t      cgiBodyPos;    // combien de cgiBody a deja ete ecrit
-    std::string cgiOutput;     // sortie du CGI accumulee
-    time_t      cgiStart;      // pour detecter un script qui boucle indefiniment
+    int         cgiStdin;
+    int         cgiStdout;
+    std::string cgiBody;
+    size_t      cgiBodyPos;
+    std::string cgiOutput;
+    time_t      cgiStart;
 
     Connection(int fd, int port, const std::vector<ServerBlock>& servers);
     ~Connection();
 
-    bool onReadable();     // appele quand poll() signale POLLIN sur le socket client
-    bool onWritable();     // appele quand poll() signale POLLOUT sur le socket client
-    bool onCgiReadable();  // appele quand poll() signale POLLIN sur cgiStdout
-    bool onCgiWritable();  // appele quand poll() signale POLLOUT sur cgiStdin
+    bool onReadable();
+    bool onWritable();
+    bool onCgiReadable();
+    bool onCgiWritable();
     bool timedOut() const;
     bool cgiTimedOut() const;
-    void abortCgi(int statusCode); // tue le CGI (timeout) et prepare une reponse d'erreur
+    void abortCgi(int statusCode);
 
 private:
     const std::vector<ServerBlock>& _servers;
-    bool                            _shouldClose; // fermer apres l'envoi ?
+    bool                            _shouldClose;
 
     const ServerBlock* selectServer() const;
     void               buildAndSend();

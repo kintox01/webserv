@@ -12,9 +12,6 @@
 
 Router::Router(const ServerBlock& server) : _server(server) {}
 
-// Trouve le bloc location qui correspond le mieux au chemin URI.
-// Algorithme : on prend le prefixe le plus long qui correspond.
-// Ex: pour /cgi-bin/test.py, on preferera /cgi-bin a /
 const LocationBlock* Router::findLocation(const std::string& path) const {
     const LocationBlock* best    = NULL;
     size_t               bestLen = 0;
@@ -31,24 +28,19 @@ const LocationBlock* Router::findLocation(const std::string& path) const {
     return best;
 }
 
-// Construit le chemin fichier a partir du root et du chemin URI.
-// Previent le path traversal (../../etc/passwd) en resolvant les ".."
-// sans jamais sortir du root.
 std::string Router::buildFilePath(const LocationBlock& loc,
                                    const std::string& reqPath) const {
-    // Enlever le prefixe de la location du chemin URI
     std::string rel = reqPath;
     if (rel.size() >= loc.path.size())
         rel = rel.substr(loc.path.size());
 
-    // Resoudre segment par segment
     std::vector<std::string> parts;
     std::string              seg;
     std::istringstream       ss(rel);
     while (std::getline(ss, seg, '/')) {
         if (seg.empty() || seg == ".") continue;
         if (seg == "..") {
-            if (!parts.empty()) parts.pop_back(); // remonter, mais pas hors du root
+            if (!parts.empty()) parts.pop_back();
         } else {
             parts.push_back(seg);
         }
@@ -63,13 +55,12 @@ std::string Router::buildFilePath(const LocationBlock& loc,
 }
 
 bool Router::methodAllowed(const LocationBlock& loc, const std::string& method) const {
-    if (loc.methods.empty()) return true; // aucune restriction = tout est permis
+    if (loc.methods.empty()) return true;
     for (size_t i = 0; i < loc.methods.size(); i++)
         if (loc.methods[i] == method) return true;
     return false;
 }
 
-// Generer une reponse d'erreur, avec page personnalisee si configuree
 HttpResponse Router::errorResponse(int code) {
     HttpResponse res;
     res.setStatus(code);
@@ -92,7 +83,6 @@ HttpResponse Router::errorResponse(int code) {
     return res;
 }
 
-// Servir un fichier statique depuis le disque
 HttpResponse Router::serveFile(const std::string& fullPath) {
     struct stat st;
     if (stat(fullPath.c_str(), &st) != 0)
@@ -108,7 +98,6 @@ HttpResponse Router::serveFile(const std::string& fullPath) {
     res.setStatus(200);
     res.setBody(buf.str(), getMimeType(fullPath));
 
-    // En-tete Last-Modified pour le cache navigateur
     char timeBuf[64];
     strftime(timeBuf, sizeof(timeBuf), "%a, %d %b %Y %H:%M:%S GMT",
              gmtime(&st.st_mtime));
@@ -116,11 +105,9 @@ HttpResponse Router::serveFile(const std::string& fullPath) {
     return res;
 }
 
-// Generer un listing HTML d'un dossier (autoindex on)
 HttpResponse Router::serveDirectory(const std::string& dirPath,
                                      const LocationBlock& loc,
                                      const std::string& uriPath) {
-    // Essayer d'abord le fichier index
     if (!loc.index.empty()) {
         std::string indexPath = dirPath + "/" + loc.index;
         struct stat st;
@@ -158,11 +145,9 @@ HttpResponse Router::serveDirectory(const std::string& dirPath,
     return res;
 }
 
-// Gerer l'upload de fichier (POST)
 HttpResponse Router::handleUpload(const LocationBlock& loc, const HttpRequest& req) {
     if (loc.upload_store.empty()) return errorResponse(403);
 
-    // Extraire le nom de fichier depuis Content-Disposition si present
     std::string filename;
     std::string cd = req.header("content-disposition");
     if (!cd.empty()) {
@@ -177,14 +162,12 @@ HttpResponse Router::handleUpload(const LocationBlock& loc, const HttpRequest& r
         }
     }
 
-    // Nom de secours base sur le timestamp
     if (filename.empty()) {
         std::ostringstream ss;
         ss << "upload_" << time(NULL);
         filename = ss.str();
     }
 
-    // Nettoyer le nom de fichier (pas de / ni de \)
     std::string safe;
     for (size_t i = 0; i < filename.size(); i++) {
         char c = filename[i];
@@ -207,14 +190,10 @@ HttpResponse Router::handleUpload(const LocationBlock& loc, const HttpRequest& r
     return res;
 }
 
-// Point d'entree principal : traiter une requete.
-// Renvoie true et remplit res si la reponse est prete tout de suite ;
-// renvoie false et remplit cgiOut si un CGI doit etre lance de facon asynchrone.
 bool Router::handle(const HttpRequest& req, HttpResponse& res, CgiRequest& cgiOut) {
     const LocationBlock* loc = findLocation(req.path);
     if (!loc) { res = errorResponse(404); return true; }
 
-    // Redirection configuree dans la location
     if (loc->redirect_code != 0) {
         res.setStatus(loc->redirect_code);
         if (!loc->redirect_url.empty())
@@ -223,13 +202,10 @@ bool Router::handle(const HttpRequest& req, HttpResponse& res, CgiRequest& cgiOu
         return true;
     }
 
-    // Methode non autorisee pour cette location
     if (!methodAllowed(*loc, req.method)) { res = errorResponse(405); return true; }
 
-    // Construire le chemin fichier
     std::string fullPath = buildFilePath(*loc, req.path);
 
-    // Verifier si un handler CGI correspond a l'extension du fichier
     if (req.method == "GET" || req.method == "POST" || req.method == "HEAD") {
         size_t dot = fullPath.rfind('.');
         if (dot != std::string::npos) {
@@ -244,22 +220,18 @@ bool Router::handle(const HttpRequest& req, HttpResponse& res, CgiRequest& cgiOu
         }
     }
 
-    // DELETE : supprimer le fichier
     if (req.method == "DELETE") {
         if (remove(fullPath.c_str()) != 0) { res = errorResponse(errno == ENOENT ? 404 : 403); return true; }
         res.setStatus(204);
         return true;
     }
 
-    // POST sans CGI = upload
     if (req.method == "POST") { res = handleUpload(*loc, req); return true; }
 
-    // GET / HEAD : servir le fichier ou le dossier
     struct stat st;
     if (stat(fullPath.c_str(), &st) != 0) { res = errorResponse(404); return true; }
 
     if (S_ISDIR(st.st_mode)) {
-        // Forcer le slash final pour que les liens relatifs fonctionnent
         if (req.path.empty() || req.path[req.path.size() - 1] != '/') {
             res.setStatus(301);
             res.setHeader("Location", req.path + "/");
@@ -271,6 +243,6 @@ bool Router::handle(const HttpRequest& req, HttpResponse& res, CgiRequest& cgiOu
     }
 
     res = serveFile(fullPath);
-    if (req.method == "HEAD") res.body.clear(); // HEAD = memes en-tetes, pas de corps
+    if (req.method == "HEAD") res.body.clear();
     return true;
 }
